@@ -2,6 +2,8 @@ version: '3'
 
 services:
   medo_nvenc_video_encoder:
+    container_name: nvenc_video_encoder
+    user: root
     deploy:
       resources:
         reservations:
