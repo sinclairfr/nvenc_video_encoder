@@ -1,16 +1,16 @@
 #!/bin/bash
 
 # Définition des dossiers et fichiers
+INPUT_DIR="/input"
 OUTPUT_DIR="/output"
-SEGMENTS_DIR="/output/segments"
-RESUME_STATE_FILE="/input/resume_state.json"
+RESUME_STATE_FILE="/resume_state/resume_state.json"
 LOG_FILE="/output/conversion.log"
 ERROR_LOG_FILE="/output/error.log"
-mkdir -p "$OUTPUT_DIR" "$SEGMENTS_DIR"
+mkdir -p "$OUTPUT_DIR"
 
 # Initialisation des fichiers de log
 echo "=== Démarrage de la conversion $(date) ===" > "$LOG_FILE"
-echo "=== VERSION: 1.3.0 ===" >> "$LOG_FILE"
+echo "=== VERSION: 1.4.0 ===" >> "$LOG_FILE"
 echo "=== Erreurs de conversion $(date) ===" > "$ERROR_LOG_FILE"
 
 # Fonction de journalisation
@@ -45,34 +45,62 @@ check_disk_space() {
     fi
 }
 
-# Fonction pour sauvegarder l'état de la conversion
+# Fonction pour sauvegarder l'état de la conversion avec ajout au fichier existant
 save_state() {
     local file="$1"
     local segment_index="$2"
     local total_segments="$3"
     local output_file="$4"
+    local file_id=$(basename "$file" | md5sum | cut -d' ' -f1)
     
-    # Format JSON simple pour l'état
-    cat > "$RESUME_STATE_FILE" << EOF
-{
-    "input_file": "$file",
-    "output_file": "$output_file",
-    "current_segment": $segment_index,
-    "total_segments": $total_segments,
-    "timestamp": "$(date '+%Y-%m-%d %H:%M:%S')"
-}
-EOF
+    # Format simple d'état en JSON minimaliste
+    local state_entry="{\"file_id\":\"$file_id\",\"input_file\":\"$file\",\"output_file\":\"$output_file\",\"current_segment\":$segment_index,\"total_segments\":$total_segments,\"timestamp\":\"$(date '+%Y-%m-%d %H:%M:%S')\"}"
+    
+    # Si le fichier d'état n'existe pas, on le crée
+    if [ ! -f "$RESUME_STATE_FILE" ]; then
+        echo "{\"conversions\":[" > "$RESUME_STATE_FILE"
+        echo "$state_entry" >> "$RESUME_STATE_FILE"
+        echo "]}" >> "$RESUME_STATE_FILE"
+    else
+        # On fait une sauvegarde du fichier
+        cp "$RESUME_STATE_FILE" "${RESUME_STATE_FILE}.bak"
+        
+        # On vérifie si le fichier existe déjà dans l'état
+        if grep -q "\"file_id\":\"$file_id\"" "$RESUME_STATE_FILE"; then
+            # On remplace l'entrée existante avec sed
+            sed -i "s|{\"file_id\":\"$file_id\".*}|$state_entry|g" "$RESUME_STATE_FILE"
+        else
+            # On ajoute la nouvelle entrée (on remplace la dernière accolade par l'entrée + accolade)
+            sed -i "s|]}|,$state_entry]}|" "$RESUME_STATE_FILE"
+        fi
+    fi
+    
     log "État sauvegardé: fichier $file, segment $segment_index/$total_segments"
 }
 
-# Fonction pour charger l'état précédent
+# Fonction pour charger l'état précédent d'un fichier spécifique
 load_state() {
+    local file="$1"
+    local file_id=$(basename "$file" | md5sum | cut -d' ' -f1)
+    
     if [ -f "$RESUME_STATE_FILE" ]; then
-        log "Fichier d'état trouvé, tentative de reprise..."
-        return 0
-    else
-        return 1
+        # On extrait la ligne correspondant au fichier
+        local state_line=$(grep -o "{\"file_id\":\"$file_id\"[^}]*}" "$RESUME_STATE_FILE")
+        
+        if [ -n "$state_line" ]; then
+            # Extraction des valeurs avec grep et sed
+            local saved_segment=$(echo "$state_line" | grep -o '"current_segment":[0-9]*' | sed 's/"current_segment"://')
+            local saved_total=$(echo "$state_line" | grep -o '"total_segments":[0-9]*' | sed 's/"total_segments"://')
+            
+            if [ -n "$saved_segment" ] && [ -n "$saved_total" ]; then
+                log "Reprise de conversion pour $(basename "$file") à partir du segment $((saved_segment + 1))/$saved_total"
+                echo "$saved_segment $saved_total"
+                return 0
+            fi
+        fi
     fi
+    
+    return 1
 }
 
 # Fonction pour obtenir la durée d'une vidéo en secondes
@@ -96,7 +124,6 @@ get_video_duration() {
 }
 
 # Fonction pour transcoder un segment
-# Fonction pour transcoder un segment
 transcode_segment() {
    local input_file="$1"
    local output_file="$2"
@@ -105,7 +132,12 @@ transcode_segment() {
    local segment_index="$5"
    local total_segments="$6"
    
-   local segment_output="${output_file%.*}_segment_${segment_index}.mp4"
+   # Création du répertoire segments dans le même dossier que le fichier d'entrée
+   local input_dir=$(dirname "$input_file")
+   local segments_dir="${input_dir}/segments"
+   mkdir -p "$segments_dir"
+   
+   local segment_output="${segments_dir}/$(basename "${output_file%.*}")_segment_${segment_index}.mp4"
    
    log "Transcodage du segment $segment_index/$total_segments (début: ${start_time}s, durée: ${duration}s)"
    
@@ -185,18 +217,21 @@ transcode_segment() {
    if [ -f "$segment_output" ] && [ -s "$segment_output" ]; then
        local filesize=$(du -h "$segment_output" | cut -f1)
        log "✅ Segment $segment_index transcodé avec succès (${filesize})"
+       # On renvoie le chemin du segment créé
+       echo "$segment_output"
        return 0
    else
        log_error "❌ Échec segment $segment_index"
        return 1
    fi
 }
+
 # Fonction pour fusionner les segments
 merge_segments() {
     local output_file="$1"
-    local total_segments="$2"
+    local segments_list="$2"
     
-    log "Fusion de $total_segments segments en fichier final: $(basename "$output_file")"
+    log "Fusion des segments en fichier final: $(basename "$output_file")"
     
     # Création d'un fichier de liste pour la fusion
     local segment_list="/tmp/segments_$$.txt"
@@ -204,16 +239,16 @@ merge_segments() {
     # Vérification des segments et création du fichier de liste
     echo "" > "$segment_list"
     local missing_segments=0
+    local total_segments=$(echo "$segments_list" | wc -l)
     
-    for ((i=0; i<total_segments; i++)); do
-        local segment="${output_file%.*}_segment_${i}.mp4"
+    while IFS= read -r segment; do
         if [ -f "$segment" ] && [ -s "$segment" ]; then
             echo "file '$segment'" >> "$segment_list"
         else
             log_error "Segment manquant ou vide pour la fusion: $(basename "$segment")"
             missing_segments=$((missing_segments + 1))
         fi
-    done
+    done <<< "$segments_list"
     
     # Si des segments sont manquants, on échoue
     if [ $missing_segments -gt 0 ]; then
@@ -242,14 +277,9 @@ merge_segments() {
         log "✅ Fusion réussie: $(basename "$output_file") (${filesize})"
         
         # Nettoyage des segments
-        for ((i=0; i<total_segments; i++)); do
-            rm -f "${output_file%.*}_segment_${i}.mp4"
-        done
-        
-        # Suppression du fichier d'état
-        if [ -f "$RESUME_STATE_FILE" ]; then
-            rm -f "$RESUME_STATE_FILE"
-        fi
+        while IFS= read -r segment; do
+            rm -f "$segment"
+        done <<< "$segments_list"
         
         return 0
     else
@@ -258,6 +288,7 @@ merge_segments() {
     fi
 }
 
+# Fonction pour convertir les fichiers par segments
 # Fonction pour convertir les fichiers par segments
 convert_file_segments() {
     local input_file="$1"
@@ -286,7 +317,6 @@ convert_file_segments() {
         return 1
     fi
     
-    # Calcul du nombre total de segments
     # Calcul du nombre total de segments, ou utilisation du paramètre
     local total_segments
     if [ "$resume_total" -gt 0 ]; then
@@ -300,22 +330,33 @@ convert_file_segments() {
     log "Durée totale: $duration secondes - $total_segments segments à créer"
     
     # Gestion de la reprise - check si le fichier d'état existe et concerne ce fichier
-    if load_state; then
-        local saved_input=$(grep -o '"input_file":"[^"]*"' "$RESUME_STATE_FILE" | cut -d'"' -f4)
-        local saved_output=$(grep -o '"output_file":"[^"]*"' "$RESUME_STATE_FILE" | cut -d'"' -f4)
-        local saved_segment=$(grep -o '"current_segment":[0-9]*' "$RESUME_STATE_FILE" | cut -d':' -f2)
-        local saved_total=$(grep -o '"total_segments":[0-9]*' "$RESUME_STATE_FILE" | cut -d':' -f2)
+    # Gestion de la reprise - check si le fichier d'état existe et concerne ce fichier
+    local state_result=$(load_state "$input_file")
+    local load_status=$?
+
+    if [ $load_status -eq 0 ] && [ -n "$state_result" ]; then
+        # Filtrer les lignes de log qui commencent par [date]
+        state_result=$(echo "$state_result" | grep -v "^\[.*\]")
         
-        if [ "$saved_input" == "$input_file" ]; then
+        # Le format est maintenant "segment total"
+        read saved_segment saved_total <<< "$state_result"
+        
+        # Vérifier que les variables ont bien été extraites et sont numériques
+        if [[ "$saved_segment" =~ ^[0-9]+$ ]] && [[ "$saved_total" =~ ^[0-9]+$ ]]; then
             log "Reprise de conversion pour $(basename "$input_file") à partir du segment $((saved_segment + 1))/$saved_total"
             start_segment=$((saved_segment + 1))
             total_segments=$saved_total
         else
-            log "Démarrage d'une nouvelle conversion (l'état sauvegardé concerne un autre fichier)"
+            log "État de reprise invalide, démarrage d'une nouvelle conversion"
         fi
+    else
+        log "Démarrage d'une nouvelle conversion"
     fi
     
     log "Traitement de $total_segments segments (reprise à $start_segment)"
+    
+    # Liste pour stocker les chemins des segments
+    local segments_paths=""
     
     # Transcodage de chaque segment
     local success=true
@@ -327,16 +368,23 @@ convert_file_segments() {
         local segment_start=$((i * segment_duration))
         
         # Transcodage du segment
-        if ! transcode_segment "$input_file" "$output_file" "$segment_start" "$segment_duration" "$i" "$total_segments"; then
+        local segment_path
+        segment_path=$(transcode_segment "$input_file" "$output_file" "$segment_start" "$segment_duration" "$i" "$total_segments")
+        
+        if [ $? -ne 0 ]; then
             log_error "Échec lors du transcodage du segment $i/$total_segments"
             success=false
             break
         fi
+        
+        # Ajout du chemin du segment à la liste
+        segments_paths="${segments_paths}${segment_path}
+"
     done
     
     # Si tous les segments ont été transcodés avec succès, on les fusionne
     if $success; then
-        if ! merge_segments "$output_file" "$total_segments"; then
+        if ! merge_segments "$output_file" "$segments_paths"; then
             log_error "Échec lors de la fusion des segments"
             return 1
         fi
@@ -345,7 +393,6 @@ convert_file_segments() {
         return 1
     fi
 }
-
 # Fonction pour traiter un dossier
 process_directory() {
     local input_dir="$1"
@@ -389,43 +436,7 @@ process_directory() {
         return 1
     fi
     
-    # Vérification si une reprise est en cours
-    if [ -f "$RESUME_STATE_FILE" ]; then
-        local saved_input=$(grep -o '"input_file":"[^"]*"' "$RESUME_STATE_FILE" | cut -d'"' -f4)
-        local saved_output=$(grep -o '"output_file":"[^"]*"' "$RESUME_STATE_FILE" | cut -d'"' -f4)
-        local saved_segment=$(grep -o '"current_segment":[0-9]*' "$RESUME_STATE_FILE" | cut -d':' -f2)
-        local saved_total=$(grep -o '"total_segments":[0-9]*' "$RESUME_STATE_FILE" | cut -d':' -f2)
-        
-        # Extraire le nom de fichier sans chemin
-        local base_saved_input=$(basename "$saved_input")
-        
-        # Recherche par nom de fichier pour reprise
-        local found_file_to_resume=false
-        for file in "${!files_to_process[@]}"; do
-            if [ "$(basename "$file")" = "$base_saved_input" ]; then
-                found_file_to_resume=true
-                log "📎 Reprise de conversion à partir du segment $((saved_segment + 1))/$saved_total"
-                
-                # Conversion avec reprise
-                if convert_file_segments "$file" "$saved_output" $((saved_segment + 1)) "$saved_total"; then
-                    converted_files=$((converted_files + 1))
-                else
-                    failed_files=$((failed_files + 1))
-                fi
-                
-                # On retire ce fichier de la liste
-                unset files_to_process["$file"]
-                break
-            fi
-        done
-        
-        # Si aucun fichier correspondant trouvé
-        if [ "$found_file_to_resume" = false ]; then
-            log "⚠️ Fichier de reprise non trouvé dans le dossier d'entrée"
-        fi
-    fi
-    
-    # Traitement des fichiers restants
+    # Traitement des fichiers
     for file in "${!files_to_process[@]}"; do
         # On récupère le nom du fichier sans l'extension
         filename=$(basename -- "$file")
@@ -461,7 +472,6 @@ process_directory() {
     return 0
 }
 
-
 # Point d'entrée principal
 main() {
     local input_dir="/input"
@@ -478,8 +488,8 @@ main() {
         mkdir -p "$OUTPUT_DIR"
     fi
     
-    # Création du dossier pour les segments
-    mkdir -p "$SEGMENTS_DIR"
+    # Création du dossier pour les segments dans input
+    mkdir -p "${input_dir}/segments"
     
     # Vérification des permissions
     if [ ! -w "$OUTPUT_DIR" ]; then
