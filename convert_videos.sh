@@ -214,17 +214,17 @@ transcode_segment() {
        rm -f "$temp_error_file"
    fi
    
-   # Vérification que le fichier a bien été créé et qu'il n'est pas vide
-   if [ -f "$segment_output" ] && [ -s "$segment_output" ]; then
-       local filesize=$(du -h "$segment_output" | cut -f1)
-       log "✅ Segment $segment_index transcodé avec succès (${filesize})"
-       # On renvoie le chemin du segment créé
-       echo "$segment_output"
-       return 0
-   else
-       log_error "❌ Échec segment $segment_index"
-       return 1
-   fi
+    # Vérification que le fichier a bien été créé et qu'il n'est pas vide
+    if [ -f "$segment_output" ] && [ -s "$segment_output" ]; then
+        local filesize=$(du -h "$segment_output" | cut -f1)
+        log "✅ Segment $segment_index transcodé avec succès (${filesize})"
+        # Uniquement renvoyer le chemin du segment, sans logs
+        echo "$segment_output"
+        return 0
+    else
+        log_error "❌ Échec segment $segment_index"
+        return 1
+    fi
 }
 
 # Fonction pour fusionner les segments
@@ -234,54 +234,40 @@ merge_segments() {
     
     log "Fusion des segments en fichier final: $(basename "$output_file")"
     
-    # Création d'un fichier de liste pour la fusion
+    # Fichier de liste pour la fusion
     local segment_list="/tmp/segments_$$.txt"
-    
-    # Vérification des segments et création du fichier de liste
     echo "" > "$segment_list"
-    local missing_segments=0
-    local total_segments=$(echo "$segments_list" | wc -l)
     
-    while IFS= read -r segment; do
-        if [ -f "$segment" ] && [ -s "$segment" ]; then
-            echo "file '$segment'" >> "$segment_list"
-        else
-            log_error "Segment manquant ou vide pour la fusion: $(basename "$segment")"
-            missing_segments=$((missing_segments + 1))
+    # Filtrer les vrais chemins de fichiers (éliminer les lignes de log)
+    local valid_segments=0
+    while IFS= read -r line; do
+        # Vérifier si c'est un chemin de fichier valide (pas une ligne de log)
+        if [[ -f "$line" && "$line" == *".mp4" ]]; then
+            echo "file '$line'" >> "$segment_list"
+            valid_segments=$((valid_segments + 1))
         fi
     done <<< "$segments_list"
     
-    # Si des segments sont manquants, on échoue
-    if [ $missing_segments -gt 0 ]; then
-        log_error "$missing_segments segments manquants sur $total_segments, fusion impossible"
+    if [ $valid_segments -eq 0 ]; then
+        log_error "Aucun segment valide trouvé pour la fusion"
         return 1
     fi
     
-    # Vérification et log du contenu du fichier de liste
-    log "Contenu du fichier de liste des segments:"
-    local list_content=$(cat "$segment_list")
-    if [ -z "$list_content" ]; then
-        log_error "Fichier de liste des segments vide!"
+    log "Fusion de $valid_segments segments"
+    
+    # Vérifier le contenu du fichier de liste
+    if [ ! -s "$segment_list" ]; then
+        log_error "Fichier de liste des segments vide"
         return 1
     fi
     
-    while IFS= read -r line; do
-        log "  $line"
-    done < "$segment_list"
-    
-    # Fusion des segments avec ffmpeg
+    # Fusion avec ffmpeg
     ffmpeg -f concat -safe 0 -i "$segment_list" -c copy "$output_file" 2>> "$ERROR_LOG_FILE"
     
-    # Vérification que le fichier final a bien été créé
+    # Vérifier le fichier final
     if [ -f "$output_file" ] && [ -s "$output_file" ]; then
         local filesize=$(du -h "$output_file" | cut -f1)
         log "✅ Fusion réussie: $(basename "$output_file") (${filesize})"
-        
-        # Nettoyage des segments
-        while IFS= read -r segment; do
-            rm -f "$segment"
-        done <<< "$segments_list"
-        
         return 0
     else
         log_error "❌ Échec de fusion pour: $(basename "$output_file")"
