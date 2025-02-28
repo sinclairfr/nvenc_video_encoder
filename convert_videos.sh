@@ -3,7 +3,7 @@
 # Définition des dossiers et fichiers
 OUTPUT_DIR="/output"
 SEGMENTS_DIR="/output/segments"
-RESUME_STATE_FILE="/output/resume_state.json"
+RESUME_STATE_FILE="/input/resume_state.json"
 LOG_FILE="/output/conversion.log"
 ERROR_LOG_FILE="/output/error.log"
 mkdir -p "$OUTPUT_DIR" "$SEGMENTS_DIR"
