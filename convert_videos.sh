@@ -215,10 +215,10 @@ transcode_segment() {
    fi
    
     # Vérification que le fichier a bien été créé et qu'il n'est pas vide
+    # À la fin de la fonction, après la vérification de la création du fichier
     if [ -f "$segment_output" ] && [ -s "$segment_output" ]; then
         local filesize=$(du -h "$segment_output" | cut -f1)
         log "✅ Segment $segment_index transcodé avec succès (${filesize})"
-        # Uniquement renvoyer le chemin du segment, sans logs
         echo "$segment_output"
         return 0
     else
@@ -228,46 +228,62 @@ transcode_segment() {
 }
 
 # Fonction pour fusionner les segments
+# Fonction pour fusionner les segments
 merge_segments() {
     local output_file="$1"
-    local segments_list="$2"
+    local segments_dir="${OUTPUT_DIR}/segments"
+    local base_filename=$(basename "${output_file%.*}")
+    local segment_list="/tmp/segments_$$.txt"
     
     log "Fusion des segments en fichier final: $(basename "$output_file")"
-    
-    # Fichier de liste pour la fusion
-    local segment_list="/tmp/segments_$$.txt"
     echo "" > "$segment_list"
     
-    # Filtrer les vrais chemins de fichiers (éliminer les lignes de log)
-    local valid_segments=0
-    while IFS= read -r line; do
-        # Vérifier si c'est un chemin de fichier valide (pas une ligne de log)
-        if [[ -f "$line" && "$line" == *".mp4" ]]; then
-            echo "file '$line'" >> "$segment_list"
-            valid_segments=$((valid_segments + 1))
-        fi
-    done <<< "$segments_list"
+    # Trouver tous les segments pour ce fichier spécifique
+    find "$segments_dir" -name "${base_filename}_segment_*.mp4" -type f -size +0 | sort -V > /tmp/found_segments_$$.txt
     
-    if [ $valid_segments -eq 0 ]; then
-        log_error "Aucun segment valide trouvé pour la fusion"
+    local total_found=$(wc -l < /tmp/found_segments_$$.txt)
+    log "Trouvé $total_found segments dans $segments_dir pour $base_filename"
+    
+    if [ $total_found -eq 0 ]; then
+        log_error "Aucun segment trouvé. Vérifiez le nom du fichier et les chemins."
         return 1
     fi
     
-    log "Fusion de $valid_segments segments"
+    # Créer le fichier de liste pour ffmpeg
+    while IFS= read -r segment; do
+        echo "file '$segment'" >> "$segment_list"
+    done < /tmp/found_segments_$$.txt
     
-    # Vérifier le contenu du fichier de liste
-    if [ ! -s "$segment_list" ]; then
-        log_error "Fichier de liste des segments vide"
-        return 1
+    # Vérifier taille attendue vs taille réelle
+    local source_file=$(find "$INPUT_DIR" -name "${base_filename}.*" -type f | head -1)
+    local source_size=0
+    if [ -f "$source_file" ]; then
+        source_size=$(du -k "$source_file" | cut -f1)
+        log "Taille source: ${source_size}K"
     fi
     
-    # Fusion avec ffmpeg
+    # Fusion
     ffmpeg -f concat -safe 0 -i "$segment_list" -c copy "$output_file" 2>> "$ERROR_LOG_FILE"
     
-    # Vérifier le fichier final
+    # Nettoyage
+    rm -f /tmp/found_segments_$$.txt
+    
+    # Vérification
     if [ -f "$output_file" ] && [ -s "$output_file" ]; then
+        local target_size=$(du -k "$output_file" | cut -f1)
         local filesize=$(du -h "$output_file" | cut -f1)
+        
         log "✅ Fusion réussie: $(basename "$output_file") (${filesize})"
+        
+        if [ $source_size -gt 0 ]; then
+            local ratio=$((target_size * 100 / source_size))
+            log "Taux de compression: ${ratio}% (source: ${source_size}K, final: ${target_size}K)"
+            
+            if [ $ratio -lt 20 ]; then
+                log_error "⚠️ Compression excessive détectée - vérifier si des segments manquent!"
+            fi
+        fi
+        
         return 0
     else
         log_error "❌ Échec de fusion pour: $(basename "$output_file")"
