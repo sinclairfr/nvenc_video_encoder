@@ -236,7 +236,6 @@ merge_segments() {
     local segment_list="/tmp/segments_$$.txt"
     
     log "Fusion des segments en fichier final: $(basename "$output_file")"
-    echo "" > "$segment_list"
     
     # Trouver tous les segments pour ce fichier spécifique
     find "$segments_dir" -name "${base_filename}_segment_*.mp4" -type f -size +0 | sort -V > /tmp/found_segments_$$.txt
@@ -262,11 +261,11 @@ merge_segments() {
         log "Taille source: ${source_size}K"
     fi
     
-    # Fusion
-    ffmpeg -f concat -safe 0 -i "$segment_list" -c copy "$output_file" 2>> "$ERROR_LOG_FILE"
+    # Amélioration de la fusion avec options supplémentaires
+    ffmpeg -f concat -safe 0 -i "$segment_list" -c copy -map 0 -map_metadata 0 "$output_file" 2>> "$ERROR_LOG_FILE"
     
     # Nettoyage
-    rm -f /tmp/found_segments_$$.txt
+    rm -f "$segment_list" /tmp/found_segments_$$.txt
     
     # Vérification
     if [ -f "$output_file" ] && [ -s "$output_file" ]; then
@@ -281,6 +280,11 @@ merge_segments() {
             
             if [ $ratio -lt 20 ]; then
                 log_error "⚠️ Compression excessive détectée - vérifier si des segments manquent!"
+                # Ajouter un diagnostic plus détaillé
+                log_error "Vérification des segments:"
+                for segment in $(cat /tmp/found_segments_$$.txt); do
+                    log_error "Segment: $segment, Taille: $(du -h "$segment")"
+                done
             fi
         fi
         
