@@ -2,13 +2,15 @@
 
 # Définition des dossiers et fichiers
 OUTPUT_DIR="/output"
+SEGMENTS_DIR="/output/segments"
+RESUME_STATE_FILE="/output/resume_state.json"
 LOG_FILE="/output/conversion.log"
 ERROR_LOG_FILE="/output/error.log"
-mkdir -p "$OUTPUT_DIR"
+mkdir -p "$OUTPUT_DIR" "$SEGMENTS_DIR"
 
 # Initialisation des fichiers de log
 echo "=== Démarrage de la conversion $(date) ===" > "$LOG_FILE"
-echo "=== VERSION: 1.1.0 ===" >> "$LOG_FILE"
+echo "=== VERSION: 1.3.0 ===" >> "$LOG_FILE"
 echo "=== Erreurs de conversion $(date) ===" > "$ERROR_LOG_FILE"
 
 # Fonction de journalisation
@@ -43,12 +45,228 @@ check_disk_space() {
     fi
 }
 
-# On définit une fonction pour convertir les fichiers
-convert_file() {
+# Fonction pour sauvegarder l'état de la conversion
+save_state() {
+    local file="$1"
+    local segment_index="$2"
+    local total_segments="$3"
+    local output_file="$4"
+    
+    # Format JSON simple pour l'état
+    cat > "$RESUME_STATE_FILE" << EOF
+{
+    "input_file": "$file",
+    "output_file": "$output_file",
+    "current_segment": $segment_index,
+    "total_segments": $total_segments,
+    "timestamp": "$(date '+%Y-%m-%d %H:%M:%S')"
+}
+EOF
+    log "État sauvegardé: fichier $file, segment $segment_index/$total_segments"
+}
+
+# Fonction pour charger l'état précédent
+load_state() {
+    if [ -f "$RESUME_STATE_FILE" ]; then
+        log "Fichier d'état trouvé, tentative de reprise..."
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Fonction pour obtenir la durée d'une vidéo en secondes
+get_video_duration() {
+    local input_file="$1"
+    
+    # Obtention de la durée totale de la vidéo
+    local duration
+    duration=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$input_file" 2>> "$ERROR_LOG_FILE")
+    
+    if [ -z "$duration" ]; then
+        log_error "Impossible de détecter la durée pour $input_file"
+        echo "0"
+        return 1
+    fi
+    
+    # Conversion en nombre entier (secondes)
+    duration=${duration%.*}
+    echo "$duration"
+    return 0
+}
+
+# Fonction pour transcoder un segment
+# Fonction pour transcoder un segment
+transcode_segment() {
+   local input_file="$1"
+   local output_file="$2"
+   local start_time="$3"
+   local duration="$4"
+   local segment_index="$5"
+   local total_segments="$6"
+   
+   local segment_output="${output_file%.*}_segment_${segment_index}.mp4"
+   
+   log "Transcodage du segment $segment_index/$total_segments (début: ${start_time}s, durée: ${duration}s)"
+   
+   # Options de base communes
+   local common_opts=(-ss "$start_time" -t "$duration"
+                     -map 0:v:0 -map 0:a:0? -sn
+                     -c:v h264_nvenc -preset p4 -profile:v main -level 4.1 -b:v 2M -maxrate 2.5M -bufsize 5M 
+                     -c:a aac -b:a 192k -ac 2 
+                     -movflags +faststart 
+                     -metadata:s:v language=und -metadata:s:a language=und 
+                     -map_chapters -1 
+                     -y -f mp4)
+   
+   # Détection du format vidéo avec gestion d'erreur
+   local video_codec
+   video_codec=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "$input_file" 2>> "$ERROR_LOG_FILE")
+   
+   # Détection de la profondeur de bits
+   local bit_depth
+   bit_depth=$(ffprobe -v error -select_streams v:0 -show_entries stream=bits_per_raw_sample -of default=noprint_wrappers=1:nokey=1 "$input_file" 2>> "$ERROR_LOG_FILE")
+   
+   # Si bit_depth est vide, essayons avec pix_fmt
+   if [ -z "$bit_depth" ] || [ "$bit_depth" = "N/A" ]; then
+       local pix_fmt
+       pix_fmt=$(ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt -of default=noprint_wrappers=1:nokey=1 "$input_file" 2>> "$ERROR_LOG_FILE")
+       
+       # Détecter si c'est un format 10 bits basé sur le pix_fmt
+       if [[ "$pix_fmt" == *"10"* ]] || [[ "$pix_fmt" == *"p10"* ]] || [[ "$pix_fmt" == *"yuv420p10"* ]]; then
+           bit_depth="10"
+       else
+           bit_depth="8"  # Par défaut on suppose 8 bits
+       fi
+   fi
+   
+   # Création d'un fichier temporaire pour les erreurs
+   local temp_error_file="/tmp/ffmpeg_error_$$.log"
+   
+   # Conversion avec différentes options selon le codec source et la profondeur de bits
+   if [[ "$bit_depth" == "10" ]] || [[ "$video_codec" == "vp9" ]] || [[ "$video_codec" == "vp8" ]] || [[ "$video_codec" == "hevc" && "$bit_depth" == "10" ]]; then
+       log "⚠️ Vidéo 10 bits détectée pour segment $segment_index - libx264 avec conversion 8 bits"
+       # Modification des options pour utiliser libx264 avec conversion en 8 bits
+       common_opts=(-ss "$start_time" -t "$duration"
+                   -map 0:v:0 -map 0:a:0? -sn
+                   -vf format=yuv420p  # Force la conversion en 8 bits
+                   -c:v libx264 -preset medium -profile:v high -level 4.1 
+                   -b:v 2M -maxrate 2.5M -bufsize 5M 
+                   -c:a aac -b:a 192k -ac 2 
+                   -movflags +faststart 
+                   -metadata:s:v language=und -metadata:s:a language=und 
+                   -map_chapters -1 
+                   -y -f mp4)
+                   
+       ffmpeg -v warning -i "$input_file" "${common_opts[@]}" "$segment_output" 2> "$temp_error_file"
+   else
+       # Accélération matérielle pour les vidéos 8 bits avec codecs compatibles
+       log "🚀 Segment $segment_index - Utilisation accélération GPU CUDA"
+       ffmpeg -v warning -hwaccel cuda -hwaccel_output_format cuda -hwaccel_device 0 -c:v h264_cuvid -surfaces 8 -i "$input_file" "${common_opts[@]}" "$segment_output" 2> "$temp_error_file"
+       
+       # Vérification d'erreur "No decoder surfaces"
+       if [ ! -s "$segment_output" ] || grep -q "No decoder surfaces" "$temp_error_file"; then
+           log "⚠️ Segment $segment_index - Problème de ressources GPU, utilisation décodage CPU"
+           ffmpeg -v warning -i "$input_file" "${common_opts[@]}" "$segment_output" 2>> "$temp_error_file"
+       fi
+   fi
+   
+   # Récupération des erreurs
+   if [ -f "$temp_error_file" ]; then
+       local error_output=$(cat "$temp_error_file")
+       if [ -n "$error_output" ]; then
+           log_error "Erreurs ffmpeg pour segment $segment_index:"
+           log_error "$error_output"
+       fi
+       rm -f "$temp_error_file"
+   fi
+   
+   # Vérification que le fichier a bien été créé et qu'il n'est pas vide
+   if [ -f "$segment_output" ] && [ -s "$segment_output" ]; then
+       local filesize=$(du -h "$segment_output" | cut -f1)
+       log "✅ Segment $segment_index transcodé avec succès (${filesize})"
+       return 0
+   else
+       log_error "❌ Échec segment $segment_index"
+       return 1
+   fi
+}
+# Fonction pour fusionner les segments
+merge_segments() {
+    local output_file="$1"
+    local total_segments="$2"
+    
+    log "Fusion de $total_segments segments en fichier final: $(basename "$output_file")"
+    
+    # Création d'un fichier de liste pour la fusion
+    local segment_list="/tmp/segments_$$.txt"
+    
+    # Vérification des segments et création du fichier de liste
+    echo "" > "$segment_list"
+    local missing_segments=0
+    
+    for ((i=0; i<total_segments; i++)); do
+        local segment="${output_file%.*}_segment_${i}.mp4"
+        if [ -f "$segment" ] && [ -s "$segment" ]; then
+            echo "file '$segment'" >> "$segment_list"
+        else
+            log_error "Segment manquant ou vide pour la fusion: $(basename "$segment")"
+            missing_segments=$((missing_segments + 1))
+        fi
+    done
+    
+    # Si des segments sont manquants, on échoue
+    if [ $missing_segments -gt 0 ]; then
+        log_error "$missing_segments segments manquants sur $total_segments, fusion impossible"
+        return 1
+    fi
+    
+    # Vérification et log du contenu du fichier de liste
+    log "Contenu du fichier de liste des segments:"
+    local list_content=$(cat "$segment_list")
+    if [ -z "$list_content" ]; then
+        log_error "Fichier de liste des segments vide!"
+        return 1
+    fi
+    
+    while IFS= read -r line; do
+        log "  $line"
+    done < "$segment_list"
+    
+    # Fusion des segments avec ffmpeg
+    ffmpeg -f concat -safe 0 -i "$segment_list" -c copy "$output_file" 2>> "$ERROR_LOG_FILE"
+    
+    # Vérification que le fichier final a bien été créé
+    if [ -f "$output_file" ] && [ -s "$output_file" ]; then
+        local filesize=$(du -h "$output_file" | cut -f1)
+        log "✅ Fusion réussie: $(basename "$output_file") (${filesize})"
+        
+        # Nettoyage des segments
+        for ((i=0; i<total_segments; i++)); do
+            rm -f "${output_file%.*}_segment_${i}.mp4"
+        done
+        
+        # Suppression du fichier d'état
+        if [ -f "$RESUME_STATE_FILE" ]; then
+            rm -f "$RESUME_STATE_FILE"
+        fi
+        
+        return 0
+    else
+        log_error "❌ Échec de fusion pour: $(basename "$output_file")"
+        return 1
+    fi
+}
+
+# Fonction pour convertir les fichiers par segments
+convert_file_segments() {
     local input_file="$1"
     local output_file="$2"
+    local resume_segment="${3:-0}"  # Défaut à 0 si non spécifié
+    local resume_total="${4:-0}"    # Défaut à 0 si non spécifié
+    local segment_duration=60       # Durée de chaque segment en secondes
     
-    log "Conversion du fichier: $(basename "$input_file")"
+    log "Conversion par segments du fichier: $(basename "$input_file")"
     
     # Vérification des droits d'accès
     if [ ! -r "$input_file" ]; then
@@ -56,238 +274,74 @@ convert_file() {
         return 1
     fi
     
-    # Détection du format vidéo avec gestion d'erreur
-    local video_codec
-    video_codec=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "$input_file" 2>> "$ERROR_LOG_FILE")
-    
-    if [ -z "$video_codec" ]; then
-        log_error "Impossible de détecter le codec vidéo pour $input_file"
-        return 1
-    fi
-    
-    log "Codec détecté: $video_codec"
-    
-    # Obtention de la durée de la vidéo pour calculer la progression
-    local duration
-    duration=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$input_file" 2>> "$ERROR_LOG_FILE")
-    
-    if [ -z "$duration" ]; then
-        log_error "Impossible de détecter la durée pour $input_file"
-        duration=0
-    else
-        duration=${duration%.*} # On supprime la partie décimale
-    fi
-    
-    # On récupère la fréquence d'images (framerate)
-    local fps
-    fps=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of default=noprint_wrappers=1:nokey=1 "$input_file" 2>> "$ERROR_LOG_FILE")
-    
-    # Si le framerate est au format x/y, on fait le calcul
-    if [[ $fps == *"/"* ]]; then
-        local num=${fps%/*}
-        local den=${fps#*/}
-        # On utilise awk à la place de bc (qui n'est pas disponible)
-        fps=$(awk "BEGIN {printf \"%.2f\", $num / $den}")
-    fi
-    log "Framerate détecté: ${fps:-Unknown} fps"
-    
-    # Récupération d'autres infos
-    local resolution audio_codec
-    resolution=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "$input_file" 2>> "$ERROR_LOG_FILE")
-    audio_codec=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "$input_file" 2>> "$ERROR_LOG_FILE")
-    log "Résolution: ${resolution:-Unknown}, Audio: ${audio_codec:-Aucun}"
-    
     # Vérification de l'espace disponible
     check_disk_space "$OUTPUT_DIR"
     
-    # Fonction pour afficher la barre de progression
-    progress_bar() {
-        local current_time=$1
-        local current_fps=$2
-        local percent=0
-        
-        if [ "$duration" -gt 0 ]; then
-            percent=$((current_time * 100 / duration))
-        fi
-        
-        # Limiter à 100%
-        if [ $percent -gt 100 ]; then
-            percent=100
-        fi
-        
-        # Construire la barre de progression
-        local bar_length=50
-        local completed=$((percent * bar_length / 100))
-        local remaining=$((bar_length - completed))
-        
-        local progress_bar="["
-        for ((i=0; i<completed; i++)); do
-            progress_bar+="="
-        done
-        
-        if [ $completed -lt $bar_length ]; then
-            progress_bar+=">"
-            remaining=$((remaining - 1))
-        fi
-        
-        for ((i=0; i<remaining; i++)); do
-            progress_bar+=" "
-        done
-        
-        progress_bar+="] $percent%"
-        
-        # Calcul du temps restant estimé
-        local eta="N/A"
-        if [ $current_time -gt 0 ] && [ $current_fps -gt 0 ] && [ $duration -gt 0 ]; then
-            local remaining_seconds=$((duration - current_time))
-            eta=$((remaining_seconds / current_fps))
-        fi
-        
-        # Affichage sur la même ligne en écrasant le contenu précédent
-        echo -ne "\r$progress_bar Temps: $current_time/${duration:-?} s | FPS: $current_fps | ETA: ${eta}s"
-    }
+    # Obtention de la durée totale de la vidéo
+    local duration
+    duration=$(get_video_duration "$input_file")
     
-    # Création d'un fichier temporaire pour les erreurs
-    local temp_error_file="/tmp/ffmpeg_error_$$.log"
-    
-    # Optimisation des permissions temporaires pour le fichier de sortie
-    # Création du répertoire avec les bonnes permissions si nécessaire
-    mkdir -p "$(dirname "$output_file")"
-    touch "$output_file" # Créer le fichier vide pour s'assurer que les permissions sont bonnes
-    chmod 777 "$output_file" # S'assurer que tout le monde peut écrire
-    
-    # Test d'écriture dans le dossier de sortie
-    local test_file="$OUTPUT_DIR/test_write_$$.tmp"
-    if ! touch "$test_file" 2> /dev/null; then
-        log_error "Impossible d'écrire dans le dossier de sortie: $OUTPUT_DIR"
+    if [ "$duration" -eq 0 ]; then
+        log_error "Impossible de déterminer la durée de la vidéo: $input_file"
         return 1
     fi
-    rm -f "$test_file"
     
-    # Options de base communes aux deux méthodes
-    local common_opts=(-map 0:v:0 -map 0:a:0? -sn
-                      -c:v h264_nvenc -preset p4 -profile:v main -level 4.1 -b:v 2M -maxrate 2.5M -bufsize 5M 
-                      -c:a aac -b:a 192k -ac 2 
-                      -movflags +faststart 
-                      -metadata:s:v language=und -metadata:s:a language=und 
-                      -map_chapters -1 
-                      -y # Force l'écrasement des fichiers existants
-                      -f mp4)
-    
-    # Construction et journalisation des commandes
-    local ffmpeg_cmd=""
-    local conversion_success=0
-    local error_output=""
-    
-    # Conversion avec différentes options selon le codec source
-    if [[ "$video_codec" == "vp9" || "$video_codec" == "vp8" ]]; then
-        log "⚠️ Codec VP8/VP9 détecté - utilisation du décodage logiciel"
-        ffmpeg_cmd="ffmpeg -v warning -i \"$input_file\" ${common_opts[*]} \"$output_file\""
-        log_command "$ffmpeg_cmd"
-        
-        # On lance ffmpeg avec la fonction de progression
-        ffmpeg -v warning -i "$input_file" "${common_opts[@]}" -progress pipe:1 "$output_file" 2> "$temp_error_file" | \
-        while read line; do
-            # Journalisation des fps et autres indicateurs
-            if [[ "$line" == "fps="* ]]; then
-                echo "$line" >> "$LOG_FILE"
-            fi
-            
-            # Extraction du temps écoulé
-            if [[ "$line" == out_time_ms* ]]; then
-                # Convertir les microsecondes en secondes
-                current_time=$((${line#out_time_ms=} / 1000000))
-                
-                # Récupération du FPS actuel (solution simple)
-                current_fps=1
-                if [[ "$line" == *"fps="* ]]; then
-                    current_fps=$(echo "$line" | grep -oP 'fps=\K[0-9]+')
-                fi
-                
-                progress_bar $current_time $current_fps
-            fi
-        done
-        echo # Nouvelle ligne après la barre de progression
+    # Calcul du nombre total de segments
+    # Calcul du nombre total de segments, ou utilisation du paramètre
+    local total_segments
+    if [ "$resume_total" -gt 0 ]; then
+        total_segments=$resume_total
     else
-        # Accélération matérielle pour les autres codecs
-        log "🚀 Utilisation de l'accélération GPU CUDA"
-        ffmpeg_cmd="ffmpeg -v warning -hwaccel cuda -hwaccel_output_format cuda -i \"$input_file\" ${common_opts[*]} \"$output_file\""
-        log_command "$ffmpeg_cmd"
+        total_segments=$((duration / segment_duration + 1))
+    fi
+    
+    # Définir le segment de départ
+    local start_segment=$resume_segment    
+    log "Durée totale: $duration secondes - $total_segments segments à créer"
+    
+    # Gestion de la reprise - check si le fichier d'état existe et concerne ce fichier
+    if load_state; then
+        local saved_input=$(grep -o '"input_file":"[^"]*"' "$RESUME_STATE_FILE" | cut -d'"' -f4)
+        local saved_output=$(grep -o '"output_file":"[^"]*"' "$RESUME_STATE_FILE" | cut -d'"' -f4)
+        local saved_segment=$(grep -o '"current_segment":[0-9]*' "$RESUME_STATE_FILE" | cut -d':' -f2)
+        local saved_total=$(grep -o '"total_segments":[0-9]*' "$RESUME_STATE_FILE" | cut -d':' -f2)
         
-        # Essayer avec l'accélération GPU
-        ffmpeg -v warning -hwaccel cuda -hwaccel_output_format cuda -i "$input_file" "${common_opts[@]}" -progress pipe:1 "$output_file" 2> "$temp_error_file" | \
-        while read line; do
-            # Journalisation des fps et autres indicateurs
-            if [[ "$line" == "fps="* ]]; then
-                echo "$line" >> "$LOG_FILE"
-            fi
-            
-            # Extraction du temps écoulé
-            if [[ "$line" == out_time_ms* ]]; then
-                # Convertir les microsecondes en secondes
-                current_time=$((${line#out_time_ms=} / 1000000))
-                
-                # Récupération du FPS actuel (solution simple)
-                current_fps=1
-                if [[ "$line" == *"fps="* ]]; then
-                    current_fps=$(echo "$line" | grep -oP 'fps=\K[0-9]+')
-                fi
-                
-                progress_bar $current_time $current_fps
-            fi
-        done
-        echo # Nouvelle ligne après la barre de progression
-        
-        # Si l'acceleration GPU a échoué, on essaie sans
-        if [ ! -s "$output_file" ]; then
-            log "⚠️ Échec de l'accélération GPU - tentative avec le décodage logiciel"
-            ffmpeg_cmd="ffmpeg -v warning -i \"$input_file\" ${common_opts[*]} \"$output_file\""
-            log_command "$ffmpeg_cmd"
-            
-            ffmpeg -v warning -i "$input_file" "${common_opts[@]}" -progress pipe:1 "$output_file" 2>> "$temp_error_file" | \
-            while read line; do
-                # Extraction du temps écoulé
-                if [[ "$line" == out_time_ms* ]]; then
-                    # Convertir les microsecondes en secondes
-                    current_time=$((${line#out_time_ms=} / 1000000))
-                    
-                    # Récupération du FPS actuel (solution simple)
-                    current_fps=1
-                    if [[ "$line" == *"fps="* ]]; then
-                        current_fps=$(echo "$line" | grep -oP 'fps=\K[0-9]+')
-                    fi
-                    
-                    progress_bar $current_time $current_fps
-                fi
-            done
-            echo # Nouvelle ligne après la barre de progression
+        if [ "$saved_input" == "$input_file" ]; then
+            log "Reprise de conversion pour $(basename "$input_file") à partir du segment $((saved_segment + 1))/$saved_total"
+            start_segment=$((saved_segment + 1))
+            total_segments=$saved_total
+        else
+            log "Démarrage d'une nouvelle conversion (l'état sauvegardé concerne un autre fichier)"
         fi
     fi
     
-    # Récupération des erreurs
-    if [ -f "$temp_error_file" ]; then
-        error_output=$(cat "$temp_error_file")
-        if [ -n "$error_output" ]; then
-            log_error "Erreurs ffmpeg pour $(basename "$input_file"):"
-            log_error "$error_output"
-        fi
-        rm -f "$temp_error_file"
-    fi
+    log "Traitement de $total_segments segments (reprise à $start_segment)"
     
-    # Vérification que le fichier a bien été créé et qu'il n'est pas vide
-    if [ -f "$output_file" ] && [ -s "$output_file" ]; then
-        local filesize=$(du -h "$output_file" | cut -f1)
-        log "✅ Conversion réussie: $(basename "$output_file") (${filesize})"
-        # Journaliser les infos du fichier converti
-        ffprobe -v error -hide_banner -of json -show_format -show_streams "$output_file" 2>/dev/null | tee -a "$LOG_FILE" > /dev/null
+    # Transcodage de chaque segment
+    local success=true
+    for ((i=start_segment; i<total_segments; i++)); do
+        # Sauvegarde de l'état actuel
+        save_state "$input_file" "$i" "$total_segments" "$output_file"
+        
+        # Calcul du point de départ du segment
+        local segment_start=$((i * segment_duration))
+        
+        # Transcodage du segment
+        if ! transcode_segment "$input_file" "$output_file" "$segment_start" "$segment_duration" "$i" "$total_segments"; then
+            log_error "Échec lors du transcodage du segment $i/$total_segments"
+            success=false
+            break
+        fi
+    done
+    
+    # Si tous les segments ont été transcodés avec succès, on les fusionne
+    if $success; then
+        if ! merge_segments "$output_file" "$total_segments"; then
+            log_error "Échec lors de la fusion des segments"
+            return 1
+        fi
         return 0
     else
-        log_error "❌ Échec de conversion pour: $(basename "$input_file")"
-        if [ -f "$output_file" ]; then
-            local filesize=$(du -h "$output_file" | cut -f1)
-            log_error "Fichier de sortie existe mais problématique: ${filesize:-0 octets}"
-            rm -f "$output_file"  # Supprimer le fichier vide ou corrompu
-        fi
         return 1
     fi
 }
@@ -314,12 +368,11 @@ process_directory() {
     
     # On parcourt tous les formats vidéo courants
     for ext in mp4 mkv avi mov webm wmv flv ts m4v; do
-        # On cherche les fichiers avec cette extension (correction pour éviter le doublon)
+        # On cherche les fichiers avec cette extension
         for file in "$input_dir"/*.$ext; do
             # Vérifie si le fichier existe et n'est pas un wildcard non résolu
             if [ -f "$file" ] 2>/dev/null; then
                 # On sauvegarde le chemin complet comme clé du tableau associatif
-                # pour éviter les doublons
                 files_to_process["$file"]=1
             fi
         done
@@ -336,7 +389,43 @@ process_directory() {
         return 1
     fi
     
-    # Traitement des fichiers
+    # Vérification si une reprise est en cours
+    if [ -f "$RESUME_STATE_FILE" ]; then
+        local saved_input=$(grep -o '"input_file":"[^"]*"' "$RESUME_STATE_FILE" | cut -d'"' -f4)
+        local saved_output=$(grep -o '"output_file":"[^"]*"' "$RESUME_STATE_FILE" | cut -d'"' -f4)
+        local saved_segment=$(grep -o '"current_segment":[0-9]*' "$RESUME_STATE_FILE" | cut -d':' -f2)
+        local saved_total=$(grep -o '"total_segments":[0-9]*' "$RESUME_STATE_FILE" | cut -d':' -f2)
+        
+        # Extraire le nom de fichier sans chemin
+        local base_saved_input=$(basename "$saved_input")
+        
+        # Recherche par nom de fichier pour reprise
+        local found_file_to_resume=false
+        for file in "${!files_to_process[@]}"; do
+            if [ "$(basename "$file")" = "$base_saved_input" ]; then
+                found_file_to_resume=true
+                log "📎 Reprise de conversion à partir du segment $((saved_segment + 1))/$saved_total"
+                
+                # Conversion avec reprise
+                if convert_file_segments "$file" "$saved_output" $((saved_segment + 1)) "$saved_total"; then
+                    converted_files=$((converted_files + 1))
+                else
+                    failed_files=$((failed_files + 1))
+                fi
+                
+                # On retire ce fichier de la liste
+                unset files_to_process["$file"]
+                break
+            fi
+        done
+        
+        # Si aucun fichier correspondant trouvé
+        if [ "$found_file_to_resume" = false ]; then
+            log "⚠️ Fichier de reprise non trouvé dans le dossier d'entrée"
+        fi
+    fi
+    
+    # Traitement des fichiers restants
     for file in "${!files_to_process[@]}"; do
         # On récupère le nom du fichier sans l'extension
         filename=$(basename -- "$file")
@@ -350,8 +439,8 @@ process_directory() {
             log "⏩ Fichier déjà converti: $output_file"
             converted_files=$((converted_files + 1))
         else
-            # On lance la conversion
-            if convert_file "$file" "$output_file"; then
+            # On lance la conversion par segments
+            if convert_file_segments "$file" "$output_file"; then
                 converted_files=$((converted_files + 1))
             else
                 failed_files=$((failed_files + 1))
@@ -372,6 +461,7 @@ process_directory() {
     return 0
 }
 
+
 # Point d'entrée principal
 main() {
     local input_dir="/input"
@@ -388,6 +478,9 @@ main() {
         mkdir -p "$OUTPUT_DIR"
     fi
     
+    # Création du dossier pour les segments
+    mkdir -p "$SEGMENTS_DIR"
+    
     # Vérification des permissions
     if [ ! -w "$OUTPUT_DIR" ]; then
         log_error "❌ Erreur: Le dossier de sortie $OUTPUT_DIR n'est pas accessible en écriture!"
@@ -402,7 +495,7 @@ main() {
         log "GPU: Non détecté (nvidia-smi non disponible)"
     fi
     
-    log "🚀 Démarrage du processus de conversion pour IPTV"
+    log "🚀 Démarrage du processus de conversion par segments pour IPTV (avec reprise)"
     if ! process_directory "$input_dir"; then
         log_error "Des problèmes sont survenus pendant la conversion"
         exit 1

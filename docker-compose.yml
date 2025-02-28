@@ -22,4 +22,5 @@ services:
       - ${OUTPUT_FOLDER}:/output
       - /mnt/docker_data:/mnt/docker_data
       - ./convert_videos.sh:/convert_videos.sh
+      - ./tmp:/tmp
     entrypoint: ["/bin/bash", "/convert_videos.sh"]
