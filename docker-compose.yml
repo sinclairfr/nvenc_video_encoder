@@ -21,9 +21,6 @@ services:
       - ${INPUT_FOLDER}:/input
       - ${OUTPUT_FOLDER}:/output
       
-      # Stockage de données Docker permanent
-      - ${DOCKER_DATA_MOUNT:-/mnt/docker_data}:/mnt/docker_data
-      
       # Script de conversion
       - ./convert_videos.sh:/convert_videos.sh
       

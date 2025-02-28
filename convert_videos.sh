@@ -53,8 +53,15 @@ save_state() {
     local output_file="$4"
     local file_id=$(basename "$file" | md5sum | cut -d' ' -f1)
     
-    # Format simple d'état en JSON minimaliste
-    local state_entry="{\"file_id\":\"$file_id\",\"input_file\":\"$file\",\"output_file\":\"$output_file\",\"current_segment\":$segment_index,\"total_segments\":$total_segments,\"timestamp\":\"$(date '+%Y-%m-%d %H:%M:%S')\"}"
+    # Échapper les caractères spéciaux pour JSON
+    local sanitized_input=$(printf '%s' "$file" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    local sanitized_output=$(printf '%s' "$output_file" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    
+    # Format d'état JSON avec noms de fichiers échappés
+    local state_entry="{\"file_id\":\"$file_id\",\"input_file\":\"$sanitized_input\",\"output_file\":\"$sanitized_output\",\"current_segment\":$segment_index,\"total_segments\":$total_segments,\"timestamp\":\"$(date '+%Y-%m-%d %H:%M:%S')\"}"
+    
+    # Crée le dossier de résumé s'il n'existe pas
+    mkdir -p "$(dirname "$RESUME_STATE_FILE")"
     
     # Si le fichier d'état n'existe pas, on le crée
     if [ ! -f "$RESUME_STATE_FILE" ]; then
@@ -65,35 +72,77 @@ save_state() {
         # On fait une sauvegarde du fichier
         cp "$RESUME_STATE_FILE" "${RESUME_STATE_FILE}.bak"
         
-        # On vérifie si le fichier existe déjà dans l'état
-        if grep -q "\"file_id\":\"$file_id\"" "$RESUME_STATE_FILE"; then
-            # On remplace l'entrée existante avec sed
-            sed -i "s|{\"file_id\":\"$file_id\".*}|$state_entry|g" "$RESUME_STATE_FILE"
-        else
-            # On ajoute la nouvelle entrée (on remplace la dernière accolade par l'entrée + accolade)
-            sed -i "s|]}|,$state_entry]}|" "$RESUME_STATE_FILE"
-        fi
+        # Fichier temporaire
+        local temp_file="/tmp/resume_state_$$.json"
+        
+        # On utilise un fichier temporaire pour reconstruire le JSON
+        # Cela évite les problèmes avec les caractères spéciaux et sed
+        {
+            # Début du fichier JSON
+            echo "{\"conversions\":["
+            
+            # On obtient les entrées existantes
+            grep -o "{\"file_id\":[^}]*}" "$RESUME_STATE_FILE" | grep -v "\"file_id\":\"$file_id\"" | tr '\n' ',' | sed 's/,$//'
+            
+            # On ajoute une virgule s'il y a des entrées existantes
+            if grep -q "\"file_id\":" "$RESUME_STATE_FILE"; then
+                echo ","
+            fi
+            
+            # On ajoute la nouvelle entrée
+            echo "$state_entry"
+            
+            # Fin du fichier JSON
+            echo "]}"
+        } > "$temp_file"
+        
+        # On remplace le fichier original
+        mv "$temp_file" "$RESUME_STATE_FILE"
     fi
     
     log "État sauvegardé: fichier $file, segment $segment_index/$total_segments"
 }
 
+# Fonction auxiliaire pour la mise à jour manuelle de l'état
+manual_state_update() {
+    local file_id="$1"
+    local state_entry="$2"
+    
+    # On vérifie si le fichier existe déjà dans l'état
+    if grep -q "\"file_id\":\"$file_id\"" "$RESUME_STATE_FILE"; then
+        # On remplace l'entrée existante en utilisant un fichier temporaire
+        local temp_file="/tmp/resume_state_$$.json"
+        awk -v id="\"file_id\":\"$file_id\"" -v entry="$state_entry" '
+        {
+            if (index($0, id) > 0) {
+                print entry;
+            } else {
+                print $0;
+            }
+        }' "$RESUME_STATE_FILE" > "$temp_file"
+        mv "$temp_file" "$RESUME_STATE_FILE"
+    else
+        # On ajoute la nouvelle entrée (on remplace la dernière accolade par l'entrée + accolade)
+        sed -i "s|]}|,$state_entry]}|" "$RESUME_STATE_FILE"
+    fi
+}
+
 # Fonction pour charger l'état précédent d'un fichier spécifique
 load_state() {
-    local file="$1"
-    local file_id=$(basename "$file" | md5sum | cut -d' ' -f1)
+    local input_file="$1"
+    local file_id=$(basename "$input_file" | md5sum | cut -d' ' -f1)
     
     if [ -f "$RESUME_STATE_FILE" ]; then
-        # On extrait la ligne correspondant au fichier
+        # On utilise grep avec l'identifiant md5 qui est plus fiable que le nom de fichier
         local state_line=$(grep -o "{\"file_id\":\"$file_id\"[^}]*}" "$RESUME_STATE_FILE")
         
         if [ -n "$state_line" ]; then
-            # Extraction des valeurs avec grep et sed
-            local saved_segment=$(echo "$state_line" | grep -o '"current_segment":[0-9]*' | sed 's/"current_segment"://')
-            local saved_total=$(echo "$state_line" | grep -o '"total_segments":[0-9]*' | sed 's/"total_segments"://')
+            # Extraction des valeurs avec sed qui gère mieux les caractères spéciaux
+            local saved_segment=$(echo "$state_line" | sed -n 's/.*"current_segment":\([0-9]*\).*/\1/p')
+            local saved_total=$(echo "$state_line" | sed -n 's/.*"total_segments":\([0-9]*\).*/\1/p')
             
             if [ -n "$saved_segment" ] && [ -n "$saved_total" ]; then
-                log "Reprise de conversion pour $(basename "$file") à partir du segment $((saved_segment + 1))/$saved_total"
+                log "Reprise de conversion pour $(basename "$input_file") à partir du segment $((saved_segment + 1))/$saved_total"
                 echo "$saved_segment $saved_total"
                 return 0
             fi
@@ -273,6 +322,8 @@ merge_segments() {
         local filesize=$(du -h "$output_file" | cut -f1)
         
         log "✅ Fusion réussie: $(basename "$output_file") (${filesize})"
+        local segments_base="${segments_dir}/${base_filename}_segment_"
+        log "💡 Suggestion: rm -rf \"${segments_base}\"* pour supprimer les segments temporaires"
         
         if [ $source_size -gt 0 ]; then
             local ratio=$((target_size * 100 / source_size))
