@@ -3,7 +3,6 @@ version: '3'
 services:
   medo_nvenc_video_encoder:
     container_name: nvenc_video_encoder
-    user: root
     deploy:
       resources:
         reservations:
@@ -22,6 +21,5 @@ services:
       - ${OUTPUT_FOLDER}:/output
       - /mnt/docker_data:/mnt/docker_data
       - ./convert_videos.sh:/convert_videos.sh
-      - ./tmp:/tmp
-      - ./resume_state:/resume_state
+      - ./resume_state:/resume_state:rw
     entrypoint: ["/bin/bash", "/convert_videos.sh"]

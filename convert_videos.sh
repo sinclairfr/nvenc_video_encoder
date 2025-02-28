@@ -132,12 +132,13 @@ transcode_segment() {
    local segment_index="$5"
    local total_segments="$6"
    
-   # Création du répertoire segments dans le même dossier que le fichier d'entrée
-   local input_dir=$(dirname "$input_file")
-   local segments_dir="${input_dir}/segments"
+   # Création du répertoire segments dans le dossier de sortie
+   local segments_dir="${OUTPUT_DIR}/segments"
    mkdir -p "$segments_dir"
    
-   local segment_output="${segments_dir}/$(basename "${output_file%.*}")_segment_${segment_index}.mp4"
+   # Nom du fichier sans chemin pour éviter les problèmes de structure
+   local base_filename=$(basename "${output_file%.*}")
+   local segment_output="${segments_dir}/${base_filename}_segment_${segment_index}.mp4"
    
    log "Transcodage du segment $segment_index/$total_segments (début: ${start_time}s, durée: ${duration}s)"
    
