@@ -1,7 +1,7 @@
 version: '3'
 
 services:
-  medo_nvenc_video_encoder:
+  nvenc_video_encoder:
     container_name: nvenc_video_encoder
     deploy:
       resources:
@@ -17,9 +17,21 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
     image: jrottenberg/ffmpeg:5.1-nvidia
     volumes:
+      # Volumes configurables via .env
       - ${INPUT_FOLDER}:/input
       - ${OUTPUT_FOLDER}:/output
-      - /mnt/docker_data:/mnt/docker_data
+      
+      # Stockage de données Docker permanent
+      - ${DOCKER_DATA_MOUNT:-/mnt/docker_data}:/mnt/docker_data
+      
+      # Script de conversion
       - ./convert_videos.sh:/convert_videos.sh
+      
+      # État de reprise
       - ./resume_state:/resume_state:rw
+      
+      # Volumes supplémentaires optionnels
+      - ${EXTRA_VOLUME_1:-/dev/null}:${EXTRA_VOLUME_1_TARGET:-/dev/null}
+      - ${EXTRA_VOLUME_2:-/dev/null}:${EXTRA_VOLUME_2_TARGET:-/dev/null}
+
     entrypoint: ["/bin/bash", "/convert_videos.sh"]
