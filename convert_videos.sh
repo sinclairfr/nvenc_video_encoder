@@ -276,7 +276,43 @@ transcode_segment() {
     fi
 }
 
-# Fonction pour fusionner les segments
+# Fonction pour assainir les noms de fichiers problématiques
+sanitize_filename() {
+    local input_dir="$1"
+    local log_prefix="[NETTOYAGE]"
+    
+    log "$log_prefix Vérification des noms de fichiers problématiques..."
+    
+    # On parcourt tous les formats vidéo courants
+    for ext in mp4 mkv avi mov webm wmv flv ts m4v; do
+        # On cherche les fichiers avec des caractères spéciaux
+        find "$input_dir" -type f -name "*.*$ext" | while read -r file; do
+            local filename=$(basename "$file")
+            local dirname=$(dirname "$file")
+            
+            # Si le nom contient des caractères spéciaux problématiques (à ajuster selon les besoins)
+            if echo "$filename" | grep -q '[：；＜＞，？　]'; then
+                log "$log_prefix Fichier avec caractères spéciaux détecté: $filename"
+                
+                # Crée un nouveau nom sans caractères spéciaux
+                local new_name=$(echo "$filename" | sed 's/[：；＜＞，？　]/_/g')
+                
+                log "$log_prefix Renommage de '$filename' en '$new_name'"
+                
+                # Renomme le fichier
+                mv "$file" "$dirname/$new_name"
+                
+                if [ $? -eq 0 ]; then
+                    log "$log_prefix ✅ Fichier renommé avec succès"
+                else
+                    log_error "$log_prefix ❌ Échec du renommage"
+                fi
+            fi
+        done
+    done
+    
+    log "$log_prefix Nettoyage des noms de fichiers terminé"
+}
 # Fonction pour fusionner les segments
 merge_segments() {
     local output_file="$1"
@@ -346,7 +382,6 @@ merge_segments() {
     fi
 }
 
-# Fonction pour convertir les fichiers par segments
 # Fonction pour convertir les fichiers par segments
 convert_file_segments() {
     local input_file="$1"
@@ -539,6 +574,9 @@ main() {
         log_error "❌ Erreur: Le dossier d'entrée $input_dir n'existe pas!"
         exit 1
     fi
+    
+    # NOUVEAU: On assainit les noms de fichiers problématiques avant tout traitement
+    sanitize_filename "$input_dir"
     
     # Vérification que le dossier de sortie existe
     if [ ! -d "$OUTPUT_DIR" ]; then
