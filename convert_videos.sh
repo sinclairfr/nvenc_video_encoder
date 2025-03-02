@@ -172,6 +172,7 @@ get_video_duration() {
     return 0
 }
 # Fonction pour transcoder un segment (modifiée)
+# Fonction pour transcoder un segment avec réessais
 transcode_segment() {
    local input_file="$1"
    local output_file="$2"
@@ -179,21 +180,22 @@ transcode_segment() {
    local duration="$4"
    local segment_index="$5"
    local total_segments="$6"
-   
-   # Format du numéro de segment sur 3 chiffres
-   local formatted_index=$(printf "%03d" $segment_index)
+   local max_retries=3  # Nombre maximal de tentatives
+   local retry_count=0
    
    # Création du répertoire segments dans le dossier de sortie
    local segments_dir="${OUTPUT_DIR}/segments"
    mkdir -p "$segments_dir"
    
    # Nom du fichier sans chemin pour éviter les problèmes de structure
+   # Dans la fonction transcode_segment
    local base_filename=$(basename "${output_file%.*}")
-   local segment_output="${segments_dir}/${base_filename}_segment_${formatted_index}.mp4"
+   # Nettoyer les duplications potentielles de "segment" dans le nom
+   base_filename=$(echo "$base_filename" | sed 's/_segment_[0-9]*$//')
+   local segment_output="${segments_dir}/${base_filename}_segment_${segment_index}.mp4"
+
+   log "Transcodage du segment $segment_index/$total_segments (début: ${start_time}s, durée: ${duration}s)"
    
-   log "Transcodage du segment $formatted_index/$total_segments (début: ${start_time}s, durée: ${duration}s)"
-   
- 
    # Options de base communes
    local common_opts=(-ss "$start_time" -t "$duration"
                      -map 0:v:0 -map 0:a:0? -sn
@@ -207,6 +209,7 @@ transcode_segment() {
    # Détection du format vidéo avec gestion d'erreur
    local video_codec
    video_codec=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "$input_file" 2>> "$ERROR_LOG_FILE")
+   log "Codec vidéo détecté: $video_codec"
    
    # Détection de la profondeur de bits
    local bit_depth
@@ -216,6 +219,7 @@ transcode_segment() {
    if [ -z "$bit_depth" ] || [ "$bit_depth" = "N/A" ]; then
        local pix_fmt
        pix_fmt=$(ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt -of default=noprint_wrappers=1:nokey=1 "$input_file" 2>> "$ERROR_LOG_FILE")
+       log "Format de pixel détecté: $pix_fmt"
        
        # Détecter si c'est un format 10 bits basé sur le pix_fmt
        if [[ "$pix_fmt" == *"10"* ]] || [[ "$pix_fmt" == *"p10"* ]] || [[ "$pix_fmt" == *"yuv420p10"* ]]; then
@@ -224,89 +228,124 @@ transcode_segment() {
            bit_depth="8"  # Par défaut on suppose 8 bits
        fi
    fi
+   log "Profondeur de bits détectée: $bit_depth"
    
-   # Création d'un fichier temporaire pour les erreurs
-   local temp_error_file="/tmp/ffmpeg_error_$$.log"
-   
-   # Conversion avec différentes options selon le codec source et la profondeur de bits
-   if [[ "$bit_depth" == "10" ]] || [[ "$video_codec" == "vp9" ]] || [[ "$video_codec" == "vp8" ]] || [[ "$video_codec" == "hevc" && "$bit_depth" == "10" ]]; then
-       log "⚠️ Vidéo 10 bits détectée pour segment $segment_index - libx264 avec conversion 8 bits"
-       # Modification des options pour utiliser libx264 avec conversion en 8 bits
-       common_opts=(-ss "$start_time" -t "$duration"
-                   -map 0:v:0 -map 0:a:0? -sn
-                   -vf format=yuv420p  # Force la conversion en 8 bits
-                   -c:v libx264 -preset medium -profile:v high -level 4.1 
-                   -b:v 2M -maxrate 2.5M -bufsize 5M 
-                   -c:a aac -b:a 192k -ac 2 
-                   -movflags +faststart 
-                   -metadata:s:v language=und -metadata:s:a language=und 
-                   -map_chapters -1 
-                   -y -f mp4)
-                   
-       ffmpeg -v warning -i "$input_file" "${common_opts[@]}" "$segment_output" 2> "$temp_error_file"
-   else
-       # Accélération matérielle pour les vidéos 8 bits avec codecs compatibles
-       log "🚀 Segment $segment_index - Utilisation accélération GPU CUDA"
-       ffmpeg -v warning -hwaccel cuda -hwaccel_output_format cuda -hwaccel_device 0 -c:v h264_cuvid -surfaces 8 -i "$input_file" "${common_opts[@]}" "$segment_output" 2> "$temp_error_file"
+   # Boucle de tentatives
+   while [ $retry_count -lt $max_retries ]; do
+       # Création d'un fichier temporaire pour les erreurs
+       local temp_error_file="/tmp/ffmpeg_error_$$.log"
        
-       # Vérification d'erreur "No decoder surfaces"
-       if [ ! -s "$segment_output" ] || grep -q "No decoder surfaces" "$temp_error_file"; then
-           log "⚠️ Segment $segment_index - Problème de ressources GPU, utilisation décodage CPU"
-           ffmpeg -v warning -i "$input_file" "${common_opts[@]}" "$segment_output" 2>> "$temp_error_file"
+       # Pour VP9, essayons d'abord avec libvpx-vp9 pour le décodage
+       if [[ "$video_codec" == "vp9" ]]; then
+           log "🔄 Tentative #$((retry_count+1)) - VP9 détecté, utilisation de libvpx-vp9"
+           
+           # Ajustement pour VP9
+           ffmpeg -v warning -i "$input_file" \
+               -ss "$start_time" -t "$duration" \
+               -map 0:v:0 -map 0:a:0? -sn \
+               -vf "format=yuv420p" \
+               -c:v libx264 -preset medium -profile:v main -level 4.1 \
+               -b:v 2M -maxrate 2.5M -bufsize 5M \
+               -c:a aac -b:a 192k -ac 2 \
+               -movflags +faststart \
+               -metadata:s:v language=und -metadata:s:a language=und \
+               -map_chapters -1 \
+               -y -f mp4 "$segment_output" 2> "$temp_error_file"
+       elif [[ "$bit_depth" == "10" ]] || [[ "$video_codec" == "hevc" && "$bit_depth" == "10" ]]; then
+           log "🔄 Tentative #$((retry_count+1)) - Vidéo 10 bits détectée, utilisation libx264 avec conversion 8 bits"
+           # Modification des options pour utiliser libx264 avec conversion en 8 bits
+           ffmpeg -v warning -i "$input_file" \
+               -ss "$start_time" -t "$duration" \
+               -map 0:v:0 -map 0:a:0? -sn \
+               -vf "format=yuv420p" \
+               -c:v libx264 -preset medium -profile:v high -level 4.1 \
+               -b:v 2M -maxrate 2.5M -bufsize 5M \
+               -c:a aac -b:a 192k -ac 2 \
+               -movflags +faststart \
+               -metadata:s:v language=und -metadata:s:a language=und \
+               -map_chapters -1 \
+               -y -f mp4 "$segment_output" 2> "$temp_error_file"
+       else
+           # En fonction du nombre de tentatives, on essaie différentes approches
+           if [ $retry_count -eq 0 ]; then
+               log "🔄 Tentative #$((retry_count+1)) - Utilisation accélération GPU CUDA"
+               ffmpeg -v warning -hwaccel cuda -hwaccel_output_format cuda -hwaccel_device 0 -c:v h264_cuvid -surfaces 8 -i "$input_file" "${common_opts[@]}" "$segment_output" 2> "$temp_error_file"
+           elif [ $retry_count -eq 1 ]; then
+               log "🔄 Tentative #$((retry_count+1)) - Utilisation décodage CPU"
+               ffmpeg -v warning -i "$input_file" "${common_opts[@]}" "$segment_output" 2> "$temp_error_file"
+           else
+               log "🔄 Tentative #$((retry_count+1)) - Utilisation libx264 (CPU) en dernier recours"
+               ffmpeg -v warning -i "$input_file" \
+                   -ss "$start_time" -t "$duration" \
+                   -map 0:v:0 -map 0:a:0? -sn \
+                   -c:v libx264 -preset medium -profile:v main \
+                   -b:v 2M -maxrate 2.5M -bufsize 5M \
+                   -c:a aac -b:a 192k -ac 2 \
+                   -movflags +faststart \
+                   -metadata:s:v language=und -metadata:s:a language=und \
+                   -map_chapters -1 \
+                   -y -f mp4 "$segment_output" 2> "$temp_error_file"
+           fi
        fi
-   fi
-   
-   # Récupération des erreurs
-   if [ -f "$temp_error_file" ]; then
-       local error_output=$(cat "$temp_error_file")
-       if [ -n "$error_output" ]; then
-           log_error "Erreurs ffmpeg pour segment $segment_index:"
-           log_error "$error_output"
-       fi
-       rm -f "$temp_error_file"
-   fi
-   
-   
-   # À la fin de la fonction, après la vérification de la création du fichier
-   if [ -f "$segment_output" ] && [ -s "$segment_output" ]; then
-       local filesize=$(du -h "$segment_output" | cut -f1)
-       log "✅ Segment $formatted_index transcodé avec succès (${filesize})"
        
-       # Vérification et retry si nécessaire
-       if ! check_segment_size "$segment_output" "$input_file" "$start_time" "$duration" "$segment_index" "$total_segments"; then
-           return 1
+       # Récupération des erreurs
+       if [ -f "$temp_error_file" ]; then
+           local error_output=$(cat "$temp_error_file")
+           if [ -n "$error_output" ]; then
+               log_error "Erreurs ffmpeg pour segment $segment_index (tentative $((retry_count+1))):"
+               log_error "$error_output"
+           fi
+           rm -f "$temp_error_file"
        fi
        
-       echo "$segment_output"
-       return 0
-   else
-       log_error "❌ Échec segment $formatted_index"
-       return 1
-   fi
+       # Vérification que le fichier a bien été créé et qu'il n'est pas vide
+       if [ -f "$segment_output" ] && [ -s "$segment_output" ]; then
+           local filesize=$(du -h "$segment_output" | cut -f1)
+           log "✅ Segment $segment_index transcodé avec succès (${filesize}) après $((retry_count+1)) tentative(s)"
+           echo "$segment_output"
+           return 0
+       else
+           log_error "❌ Échec segment $segment_index (tentative $((retry_count+1)))"
+           retry_count=$((retry_count + 1))
+           
+           # Petite pause avant de réessayer
+           sleep 2
+       fi
+   done
+   
+   log_error "❌ Échec définitif du segment $segment_index après $max_retries tentatives"
+   return 1
+}
+# Fonction pour nettoyer les noms de fichiers (à ajouter)
+clean_filename() {
+    local filename="$1"
+    # Supprimer les duplications de "_segment_X"
+    echo "$filename" | sed 's/_segment_[0-9]*//g'
 }
 # Fonction pour assainir les noms de fichiers problématiques
 sanitize_filename() {
     local input_dir="$1"
     local log_prefix="[NETTOYAGE]"
     
-    log "$log_prefix Nettoyage des noms de fichiers problématiques..."
+    log "$log_prefix Vérification des noms de fichiers problématiques..."
     
     # On parcourt tous les formats vidéo courants
     for ext in mp4 mkv avi mov webm wmv flv ts m4v; do
-        # On cherche les fichiers avec cette extension
+        # On cherche les fichiers avec des caractères spéciaux ou espaces
         find "$input_dir" -type f -name "*.$ext" | while read -r file; do
             local filename=$(basename "$file")
             local dirname=$(dirname "$file")
             
-            # Création d'un nouveau nom bulletproof
-            # 1. Remplacer les espaces et caractères spéciaux par des underscores
-            # 2. Garder uniquement les caractères alphanumériques, underscores et points
-            # 3. Enlever les underscores multiples
-            local new_name=$(echo "$filename" | tr ' ' '_' | tr -c 'a-zA-Z0-9_.\-' '_' | sed 's/__*/_/g')
-            
-            # Ne renommer que si le nom a changé
-            if [ "$filename" != "$new_name" ]; then
-                log "$log_prefix Renommage: '$filename' → '$new_name'"
+            # Si le nom contient des caractères problématiques
+            if echo "$filename" | grep -q '[：；＜＞，？　 ]'; then
+                log "$log_prefix Fichier avec caractères spéciaux détecté: $filename"
+                
+                # Crée un nouveau nom sans caractères spéciaux, garde l'extension d'origine
+                local base="${filename%.*}"
+                local extension="${filename##*.}"
+                local new_name=$(echo "$base" | sed 's/[：；＜＞，？　 ]/_/g')."$extension"
+                
+                log "$log_prefix Renommage de '$filename' en '$new_name'"
                 
                 # Renomme le fichier
                 mv "$file" "$dirname/$new_name"
@@ -327,12 +366,17 @@ merge_segments() {
     local output_file="$1"
     local segments_dir="${OUTPUT_DIR}/segments"
     local base_filename=$(basename "${output_file%.*}")
+    # On supprime d'éventuels _segment_ déjà présents dans le nom
+    base_filename=$(echo "$base_filename" | sed 's/_segment_[0-9]*$//')
     local segment_list="/tmp/segments_$$.txt"
     
-    log "Fusion des segments en fichier final: $(basename "$output_file")"
+    # IMPORTANT: Initialisation du fichier de liste (cette ligne manque)
+    > "$segment_list"
     
-    # Trouver tous les segments pour ce fichier spécifique (nouveau pattern avec 3 chiffres)
-    find "$segments_dir" -name "${base_filename}_segment_[0-9][0-9][0-9].mp4" -type f -size +0 | sort -V > /tmp/found_segments_$$.txt
+    log "Fusion des segments en fichier final: $(basename "$output_file")"
+        
+    # Trouver tous les segments pour ce fichier spécifique
+    find "$segments_dir" -name "${base_filename}_segment_*.mp4" -type f -size +0 | sort -V > /tmp/found_segments_$$.txt
     
     local total_found=$(wc -l < /tmp/found_segments_$$.txt)
     log "Trouvé $total_found segments dans $segments_dir pour $base_filename"
@@ -342,11 +386,36 @@ merge_segments() {
         return 1
     fi
     
+    # Vérifier la continuité des segments
+    local missing_segments=""
+    local prev_index=-1
+    for segment in $(cat /tmp/found_segments_$$.txt); do
+        # Utiliser une méthode plus fiable pour extraire le numéro
+        local current_index=$(basename "$segment" | grep -o "_segment_[0-9]*" | sed 's/_segment_//')
+        
+        # Conversion en entier pour éviter les problèmes de base
+        current_index=$((10#$current_index))
+        
+        if [ $prev_index -ne -1 ]; then
+            local expected_index=$((prev_index + 1))
+            if [ "$current_index" -ne "$expected_index" ]; then
+                missing_segments="$missing_segments $expected_index"
+                log_error "Segment manquant: $expected_index (entre $prev_index et $current_index)"
+            fi
+        fi
+        prev_index=$current_index
+    done
+    
+    if [ -n "$missing_segments" ]; then
+        log_error "Attention: Segments manquants détectés: $missing_segments"
+        log_error "Vérifiez les erreurs pour ces segments spécifiques"
+    fi
+    
     # Créer le fichier de liste pour ffmpeg
     while IFS= read -r segment; do
         echo "file '$segment'" >> "$segment_list"
     done < /tmp/found_segments_$$.txt
-    
+
     # Vérifier taille attendue vs taille réelle
     local source_file=$(find "$INPUT_DIR" -name "${base_filename}.*" -type f | head -1)
     local source_size=0
@@ -356,6 +425,12 @@ merge_segments() {
     fi
     
     # Amélioration de la fusion avec options supplémentaires
+    # Amélioration de la fusion avec options supplémentaires
+    log "Démarrage de la fusion avec $(wc -l < "$segment_list") segments listés"
+    # Afficher les 5 premiers segments pour debug
+    head -n 5 "$segment_list" | while read line; do
+        log "  Segment: $line"
+    done
     ffmpeg -f concat -safe 0 -i "$segment_list" -c copy -map 0 -map_metadata 0 "$output_file" 2>> "$ERROR_LOG_FILE"
     
     # Nettoyage

@@ -18,18 +18,22 @@ services:
     image: jrottenberg/ffmpeg:5.1-nvidia
     volumes:
       - TZ=Europe/Paris
-       # Volumes configurables via .env
       - ${INPUT_FOLDER}:/input
       - ${OUTPUT_FOLDER}:/output
-      
-      # Script de conversion
       - ./convert_videos.sh:/convert_videos.sh
-      
-      # État de reprise
       - ./resume_state:/resume_state:rw
-      
-      # Volumes supplémentaires optionnels
       - ${EXTRA_VOLUME_1:-/dev/null}:${EXTRA_VOLUME_1_TARGET:-/dev/null}
       - ${EXTRA_VOLUME_2:-/dev/null}:${EXTRA_VOLUME_2_TARGET:-/dev/null}
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        # Create the medo user with UID and GID 1001
+        useradd -u 1000 -m medo 2>/dev/null || true
+        groupadd -g 1000 medo 2>/dev/null || true
+        usermod -aG medo medo
 
-    entrypoint: ["/bin/bash", "/convert_videos.sh"]
+        # Change ownership of the directories
+        chown -R medo:medo /input /output /resume_state
+
+        # Switch to the medo user and execute the script
+        exec runuser -u medo -- /convert_videos.sh
