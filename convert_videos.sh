@@ -171,8 +171,7 @@ get_video_duration() {
     echo "$duration"
     return 0
 }
-
-# Fonction pour transcoder un segment
+# Fonction pour transcoder un segment (modifiée)
 transcode_segment() {
    local input_file="$1"
    local output_file="$2"
@@ -181,16 +180,20 @@ transcode_segment() {
    local segment_index="$5"
    local total_segments="$6"
    
+   # Format du numéro de segment sur 3 chiffres
+   local formatted_index=$(printf "%03d" $segment_index)
+   
    # Création du répertoire segments dans le dossier de sortie
    local segments_dir="${OUTPUT_DIR}/segments"
    mkdir -p "$segments_dir"
    
    # Nom du fichier sans chemin pour éviter les problèmes de structure
    local base_filename=$(basename "${output_file%.*}")
-   local segment_output="${segments_dir}/${base_filename}_segment_${segment_index}.mp4"
+   local segment_output="${segments_dir}/${base_filename}_segment_${formatted_index}.mp4"
    
-   log "Transcodage du segment $segment_index/$total_segments (début: ${start_time}s, durée: ${duration}s)"
+   log "Transcodage du segment $formatted_index/$total_segments (début: ${start_time}s, durée: ${duration}s)"
    
+ 
    # Options de base communes
    local common_opts=(-ss "$start_time" -t "$duration"
                      -map 0:v:0 -map 0:a:0? -sn
@@ -263,41 +266,47 @@ transcode_segment() {
        rm -f "$temp_error_file"
    fi
    
-    # Vérification que le fichier a bien été créé et qu'il n'est pas vide
-    # À la fin de la fonction, après la vérification de la création du fichier
-    if [ -f "$segment_output" ] && [ -s "$segment_output" ]; then
-        local filesize=$(du -h "$segment_output" | cut -f1)
-        log "✅ Segment $segment_index transcodé avec succès (${filesize})"
-        echo "$segment_output"
-        return 0
-    else
-        log_error "❌ Échec segment $segment_index"
-        return 1
-    fi
+   
+   # À la fin de la fonction, après la vérification de la création du fichier
+   if [ -f "$segment_output" ] && [ -s "$segment_output" ]; then
+       local filesize=$(du -h "$segment_output" | cut -f1)
+       log "✅ Segment $formatted_index transcodé avec succès (${filesize})"
+       
+       # Vérification et retry si nécessaire
+       if ! check_segment_size "$segment_output" "$input_file" "$start_time" "$duration" "$segment_index" "$total_segments"; then
+           return 1
+       fi
+       
+       echo "$segment_output"
+       return 0
+   else
+       log_error "❌ Échec segment $formatted_index"
+       return 1
+   fi
 }
-
 # Fonction pour assainir les noms de fichiers problématiques
 sanitize_filename() {
     local input_dir="$1"
     local log_prefix="[NETTOYAGE]"
     
-    log "$log_prefix Vérification des noms de fichiers problématiques..."
+    log "$log_prefix Nettoyage des noms de fichiers problématiques..."
     
     # On parcourt tous les formats vidéo courants
     for ext in mp4 mkv avi mov webm wmv flv ts m4v; do
-        # On cherche les fichiers avec des caractères spéciaux
-        find "$input_dir" -type f -name "*.*$ext" | while read -r file; do
+        # On cherche les fichiers avec cette extension
+        find "$input_dir" -type f -name "*.$ext" | while read -r file; do
             local filename=$(basename "$file")
             local dirname=$(dirname "$file")
             
-            # Si le nom contient des caractères spéciaux problématiques (à ajuster selon les besoins)
-            if echo "$filename" | grep -q '[：；＜＞，？　]'; then
-                log "$log_prefix Fichier avec caractères spéciaux détecté: $filename"
-                
-                # Crée un nouveau nom sans caractères spéciaux
-                local new_name=$(echo "$filename" | sed 's/[：；＜＞，？　]/_/g')
-                
-                log "$log_prefix Renommage de '$filename' en '$new_name'"
+            # Création d'un nouveau nom bulletproof
+            # 1. Remplacer les espaces et caractères spéciaux par des underscores
+            # 2. Garder uniquement les caractères alphanumériques, underscores et points
+            # 3. Enlever les underscores multiples
+            local new_name=$(echo "$filename" | tr ' ' '_' | tr -c 'a-zA-Z0-9_.\-' '_' | sed 's/__*/_/g')
+            
+            # Ne renommer que si le nom a changé
+            if [ "$filename" != "$new_name" ]; then
+                log "$log_prefix Renommage: '$filename' → '$new_name'"
                 
                 # Renomme le fichier
                 mv "$file" "$dirname/$new_name"
@@ -313,7 +322,7 @@ sanitize_filename() {
     
     log "$log_prefix Nettoyage des noms de fichiers terminé"
 }
-# Fonction pour fusionner les segments
+# Fonction pour fusionner les segments (modifiée pour format 3 chiffres)
 merge_segments() {
     local output_file="$1"
     local segments_dir="${OUTPUT_DIR}/segments"
@@ -322,8 +331,8 @@ merge_segments() {
     
     log "Fusion des segments en fichier final: $(basename "$output_file")"
     
-    # Trouver tous les segments pour ce fichier spécifique
-    find "$segments_dir" -name "${base_filename}_segment_*.mp4" -type f -size +0 | sort -V > /tmp/found_segments_$$.txt
+    # Trouver tous les segments pour ce fichier spécifique (nouveau pattern avec 3 chiffres)
+    find "$segments_dir" -name "${base_filename}_segment_[0-9][0-9][0-9].mp4" -type f -size +0 | sort -V > /tmp/found_segments_$$.txt
     
     local total_found=$(wc -l < /tmp/found_segments_$$.txt)
     log "Trouvé $total_found segments dans $segments_dir pour $base_filename"
@@ -381,7 +390,52 @@ merge_segments() {
         return 1
     fi
 }
-
+# Vérifier la séquence de segments pour détecter les trous
+check_segments_sequence() {
+    local base_filename="$1"
+    local segments_dir="${OUTPUT_DIR}/segments"
+    local expected_total="$2"
+    
+    log "Vérification de la séquence des segments..."
+    
+    # Liste tous les segments existants avec leur numéro extrait
+    find "$segments_dir" -name "${base_filename}_segment_*.mp4" -type f -size +0 | while read -r seg_file; do
+        # Extrait le numéro de segment (format 3 chiffres)
+        seg_num=$(echo "$seg_file" | grep -o '_segment_[0-9][0-9][0-9]' | sed 's/_segment_//')
+        
+        # Convertit en nombre (supprime les zéros en tête)
+        seg_num=$((10#$seg_num))
+        
+        echo "$seg_num"
+    done | sort -n > /tmp/existing_segments_$$.txt
+    
+    # Vérifier les segments manquants
+    local prev=0
+    local missing=0
+    
+    while read -r num; do
+        # Si l'écart est supérieur à 1, il y a des segments manquants
+        if [ $((num - prev)) -gt 1 ]; then
+            for ((i=prev+1; i<num; i++)); do
+                formatted_i=$(printf "%03d" $i)
+                log_error "❌ Segment manquant: ${base_filename}_segment_${formatted_i}.mp4"
+                missing=$((missing + 1))
+            done
+        fi
+        prev=$num
+    done < /tmp/existing_segments_$$.txt
+    
+    # Vérifier si tous les segments attendus sont présents
+    local found=$(wc -l < /tmp/existing_segments_$$.txt)
+    
+    if [ "$found" -lt "$expected_total" ]; then
+        log_error "❌ Segments manquants: $missing détectés, $found trouvés sur $expected_total attendus"
+        return 1
+    else
+        log "✅ Séquence de segments complète: $found sur $expected_total"
+        return 0
+    fi
+}
 # Fonction pour convertir les fichiers par segments
 convert_file_segments() {
     local input_file="$1"
@@ -486,6 +540,55 @@ convert_file_segments() {
         return 1
     fi
 }
+# Fonction pour vérifier la taille des segments et relancer si nécessaire
+check_segment_size() {
+    local segment_file="$1"
+    local min_size=5000000  # Taille minimale (5Mo)
+    local input_file="$2"
+    local start_time="$3"
+    local duration="$4"
+    local segment_index="$5"
+    local total_segments="$6"
+    local retry_count=2
+    
+    # Vérifier si le fichier existe
+    if [ ! -f "$segment_file" ]; then
+        log_error "Segment introuvable: $segment_file"
+        return 1
+    fi
+    
+    # Vérifier la taille du fichier
+    local file_size=$(stat -c %s "$segment_file")
+    
+    if [ "$file_size" -lt "$min_size" ]; then
+        log_error "Segment $segment_index trop petit (${file_size} octets < ${min_size} octets), tentative de reconversion..."
+        
+        # Tentatives de reconversion
+        for ((retry=1; retry<=retry_count; retry++)); do
+            log "Tentative $retry/$retry_count pour le segment $segment_index"
+            
+            # Supprimer l'ancien segment
+            rm -f "$segment_file"
+            
+            # Reconvertir le segment avec un délai aléatoire
+            sleep $((RANDOM % 3 + 1))
+            local new_segment=$(transcode_segment "$input_file" "${segment_file%_*}.mp4" "$start_time" "$duration" "$segment_index" "$total_segments")
+            
+            if [ $? -eq 0 ]; then
+                local new_size=$(stat -c %s "$new_segment")
+                if [ "$new_size" -ge "$min_size" ]; then
+                    log "✅ Reconversion réussie pour segment $segment_index (nouvelle taille: $new_size octets)"
+                    return 0
+                fi
+            fi
+        done
+        
+        log_error "❌ Échec après $retry_count tentatives pour segment $segment_index"
+        return 1
+    fi
+    
+    return 0
+}
 # Fonction pour traiter un dossier
 process_directory() {
     local input_dir="$1"
@@ -564,7 +667,55 @@ process_directory() {
     
     return 0
 }
-
+# Fonction pour vérifier la taille des segments et relancer si nécessaire
+check_segment_size() {
+    local segment_file="$1"
+    local min_size=5000000  # Taille minimale (5Mo)
+    local input_file="$2"
+    local start_time="$3"
+    local duration="$4"
+    local segment_index="$5"
+    local total_segments="$6"
+    local retry_count=2
+    
+    # Vérifier si le fichier existe
+    if [ ! -f "$segment_file" ]; then
+        log_error "Segment introuvable: $segment_file"
+        return 1
+    fi
+    
+    # Vérifier la taille du fichier
+    local file_size=$(stat -c %s "$segment_file")
+    
+    if [ "$file_size" -lt "$min_size" ]; then
+        log_error "Segment $segment_index trop petit (${file_size} octets < ${min_size} octets), tentative de reconversion..."
+        
+        # Tentatives de reconversion
+        for ((retry=1; retry<=retry_count; retry++)); do
+            log "Tentative $retry/$retry_count pour le segment $segment_index"
+            
+            # Supprimer l'ancien segment
+            rm -f "$segment_file"
+            
+            # Reconvertir le segment avec un délai aléatoire
+            sleep $((RANDOM % 3 + 1))
+            local new_segment=$(transcode_segment "$input_file" "${segment_file%_*}.mp4" "$start_time" "$duration" "$segment_index" "$total_segments")
+            
+            if [ $? -eq 0 ]; then
+                local new_size=$(stat -c %s "$new_segment")
+                if [ "$new_size" -ge "$min_size" ]; then
+                    log "✅ Reconversion réussie pour segment $segment_index (nouvelle taille: $new_size octets)"
+                    return 0
+                fi
+            fi
+        done
+        
+        log_error "❌ Échec après $retry_count tentatives pour segment $segment_index"
+        return 1
+    fi
+    
+    return 0
+}
 # Point d'entrée principal
 main() {
     local input_dir="/input"
